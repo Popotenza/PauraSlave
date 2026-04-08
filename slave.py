@@ -115,10 +115,18 @@ async def copy_to_target(client, log, msg, target, buttons_rows):
         buttons  = build_buttons(buttons_rows)
 
         if msg.media:
-            await client.send_file(
-                target, file=msg.media, caption=text,
-                formatting_entities=entities, buttons=buttons, silent=False
-            )
+            try:
+                await client.send_file(
+                    target, file=msg.media, caption=text,
+                    formatting_entities=entities, buttons=buttons, silent=False
+                )
+            except Exception as media_err:
+                log.warning(f"Media fallito su {target} ({media_err}) — invio solo testo")
+                if text:
+                    await client.send_message(
+                        target, text,
+                        formatting_entities=entities, buttons=buttons
+                    )
         else:
             await client.send_message(
                 target, text,
