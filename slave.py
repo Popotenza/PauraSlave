@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import urllib.request
 import urllib.error
 
@@ -189,8 +190,6 @@ async def handle_private_message(event, client, log, master_url: str, state: Acc
 # ── Spam loop ─────────────────────────────────────────────────────────────────
 
 async def spam_loop(client, log, master_url: str, account_index: int, state: AccountState):
-    rotation_indices: dict[str, int] = {}
-
     while True:
         cfg = fetch_master_config(master_url)
         if not cfg:
@@ -203,45 +202,41 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
             await asyncio.sleep(cfg.get("interval", 10) * 60)
             continue
 
-        sources      = cfg.get("sources", [])
+        # sorgenti: usa quelle specifiche dello slave, altrimenti quelle del master
+        slave_sources_map = cfg.get("slave_sources", {})
+        my_sources = slave_sources_map.get(str(account_index)) or cfg.get("sources", [])
+
         targets      = cfg.get("targets", [])
         buttons_rows = cfg.get("buttons_rows", [])
         default_interval = max(1, cfg.get("interval", 10))
         slave_intervals  = cfg.get("slave_intervals", {})
         interval = max(1, slave_intervals.get(str(account_index), default_interval))
-        log.info(f"⏱ Intervallo account-{account_index}: {interval} min (default master: {default_interval} min)")
+
+        src_label = f"proprie ({len(my_sources)})" if str(account_index) in slave_sources_map else f"master ({len(my_sources)})"
+        log.info(f"⏱ Intervallo: {interval} min | Sorgenti: {src_label}")
 
         state.current_targets = targets
 
-        if not sources or not targets:
+        if not my_sources or not targets:
             log.info("Nessuna sorgente o destinazione configurata — attendo...")
             await asyncio.sleep(interval * 60)
             continue
 
-        for source in sources:
+        for source in my_sources:
             try:
                 all_msgs = await client.get_messages(source, limit=200)
-                valid = sorted(
-                    [m for m in all_msgs if m.message or m.media],
-                    key=lambda m: m.id
-                )
+                valid = [m for m in all_msgs if m.message or m.media]
                 if not valid:
                     continue
 
-                key = source
-                if key not in rotation_indices:
-                    rotation_indices[key] = account_index % len(valid)
-
-                idx = rotation_indices[key] % len(valid)
-                msg = valid[idx]
-                log.info(f"📤 Post {idx+1}/{len(valid)} (id={msg.id}) da {source}")
+                # messaggio casuale — ogni slave manda un post diverso
+                msg = random.choice(valid)
+                log.info(f"📤 Post random (id={msg.id}) da {source}")
 
                 await asyncio.gather(*[
                     copy_to_target(client, log, msg, t, buttons_rows)
                     for t in targets
                 ])
-
-                rotation_indices[key] = (idx + 1) % len(valid)
 
             except Exception as e:
                 log.error(f"Errore sorgente {source}: {e}")
