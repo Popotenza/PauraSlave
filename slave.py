@@ -206,7 +206,10 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
         sources      = cfg.get("sources", [])
         targets      = cfg.get("targets", [])
         buttons_rows = cfg.get("buttons_rows", [])
-        interval     = max(1, cfg.get("interval", 10))
+        default_interval = max(1, cfg.get("interval", 10))
+        slave_intervals  = cfg.get("slave_intervals", {})
+        interval = max(1, slave_intervals.get(str(account_index), default_interval))
+        log.info(f"⏱ Intervallo account-{account_index}: {interval} min (default master: {default_interval} min)")
 
         state.current_targets = targets
 
