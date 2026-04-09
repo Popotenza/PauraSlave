@@ -217,16 +217,23 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
 
         # sorgenti: usa quelle specifiche dello slave, altrimenti quelle del master
         slave_sources_map = cfg.get("slave_sources", {})
-        my_sources = slave_sources_map.get(str(account_index)) or cfg.get("sources", [])
+        slave_key = str(account_index)
+        slave_specific = slave_sources_map.get(slave_key)
+
+        if slave_specific:  # lista non vuota → usa sorgenti proprie
+            my_sources = slave_specific
+            src_tipo = f"PROPRIE slave {slave_key}"
+        else:  # nessuna sorgente specifica → cade su master
+            my_sources = cfg.get("sources", [])
+            src_tipo = "MASTER (nessuna sorgente propria impostata)"
 
         targets      = cfg.get("targets", [])
         buttons_rows = cfg.get("buttons_rows", [])
         default_interval = max(1, cfg.get("interval", 10))
         slave_intervals  = cfg.get("slave_intervals", {})
-        interval = max(1, slave_intervals.get(str(account_index), default_interval))
+        interval = max(1, slave_intervals.get(slave_key, default_interval))
 
-        src_label = f"proprie ({len(my_sources)})" if str(account_index) in slave_sources_map else f"master ({len(my_sources)})"
-        log.info(f"⏱ Intervallo: {interval} min | Sorgenti: {src_label}")
+        log.info(f"⏱ Intervallo: {interval} min | Sorgenti {src_tipo}: {my_sources}")
 
         state.current_targets = targets
         state.maybe_clear_replied_users()
@@ -241,6 +248,7 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
                 all_msgs = await client.get_messages(source, limit=200)
                 valid = [m for m in all_msgs if m.message or m.media]
                 if not valid:
+                    log.warning(f"Nessun messaggio valido in {source}")
                     continue
 
                 # messaggio casuale — ogni slave manda un post diverso
@@ -253,7 +261,7 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
                 ])
 
             except Exception as e:
-                log.error(f"Errore sorgente {source}: {e}")
+                log.error(f"❌ Errore sorgente {source}: {e} — verifica che l'account sia membro del canale")
 
         await asyncio.sleep(interval * 60)
 
