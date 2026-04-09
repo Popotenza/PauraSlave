@@ -51,15 +51,21 @@ logging.basicConfig(
 
 # ── Stato per account ─────────────────────────────────────────────────────────
 
+REPLIED_USERS_MAX = 500  # svuota dopo questa soglia per non crescere all'infinito
+
 class AccountState:
     def __init__(self):
         self.current_targets: list = []
         self.replied_users: set = set()
 
+    def maybe_clear_replied_users(self):
+        if len(self.replied_users) >= REPLIED_USERS_MAX:
+            self.replied_users.clear()
+
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def fetch_master_config(master_url: str) -> dict | None:
+def _fetch_master_config_sync(master_url: str) -> dict | None:
     url = master_url.rstrip("/") + "/api/slave-config"
     try:
         with urllib.request.urlopen(url, timeout=15) as resp:
@@ -69,6 +75,10 @@ def fetch_master_config(master_url: str) -> dict | None:
     except Exception as e:
         logging.error(f"Impossibile contattare il master: {e}")
     return None
+
+async def fetch_master_config(master_url: str) -> dict | None:
+    """Fetch non-bloccante: eseguito in un thread separato per non bloccare asyncio."""
+    return await asyncio.to_thread(_fetch_master_config_sync, master_url)
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -109,7 +119,7 @@ async def user_is_in_target(client, user_id: int, target) -> bool:
         return False
 
 
-async def copy_to_target(client, log, msg, target, buttons_rows):
+async def copy_to_target(client, log, msg, target, buttons_rows, _retries=0):
     try:
         text     = msg.message or getattr(msg, "caption", "") or ""
         entities = msg.entities or []
@@ -136,9 +146,12 @@ async def copy_to_target(client, log, msg, target, buttons_rows):
         log.info(f"✅ msg {msg.id} → {target}")
 
     except FloodWaitError as e:
-        log.warning(f"FloodWait {e.seconds}s")
+        if _retries >= 3:
+            log.error(f"FloodWait ripetuto ({_retries}x) su {target}, messaggio saltato.")
+            return
+        log.warning(f"FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
         await asyncio.sleep(e.seconds + 1)
-        await copy_to_target(client, log, msg, target, buttons_rows)
+        await copy_to_target(client, log, msg, target, buttons_rows, _retries + 1)
     except Exception as e:
         log.error(f"Errore → {target}: {e}")
 
@@ -157,7 +170,7 @@ async def handle_private_message(event, client, log, master_url: str, state: Acc
     if not state.current_targets:
         return
 
-    cfg = fetch_master_config(master_url)
+    cfg = await fetch_master_config(master_url)
     if not cfg:
         return
 
@@ -191,7 +204,7 @@ async def handle_private_message(event, client, log, master_url: str, state: Acc
 
 async def spam_loop(client, log, master_url: str, account_index: int, state: AccountState):
     while True:
-        cfg = fetch_master_config(master_url)
+        cfg = await fetch_master_config(master_url)
         if not cfg:
             log.warning("Config master non disponibile, riprovo tra 60s")
             await asyncio.sleep(60)
@@ -216,6 +229,7 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
         log.info(f"⏱ Intervallo: {interval} min | Sorgenti: {src_label}")
 
         state.current_targets = targets
+        state.maybe_clear_replied_users()
 
         if not my_sources or not targets:
             log.info("Nessuna sorgente o destinazione configurata — attendo...")
