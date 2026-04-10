@@ -1,31 +1,21 @@
 """
 Telegram Slave Userbot — Multi-Account
 =======================================
-Un unico script che gestisce N account Telegram in parallelo,
-tutti controllati dal master.
+Gestisce N account Telegram in parallelo, controllati dal master.
 
-── CONFIGURAZIONE VARIABILI D'AMBIENTE ────────────────────────────────────────
+── VARIABILI D'AMBIENTE ──────────────────────────────────────────
+  MASTER_URL       — URL del master (con o senza https://)
+                     es: https://tuomaster.up.railway.app
 
-  MASTER_URL       — URL del master, es: https://tuomaster.up.railway.app
-
-  Per ogni account (sostituisci N con 1, 2, 3, ...):
+  Per ogni account (N = 1, 2, 3, ...):
     API_ID_N         — API ID dell'account N  (da my.telegram.org)
     API_HASH_N       — API Hash dell'account N
-    SESSION_STRING_N — Session string dell'account N (lascia vuota al primo avvio)
+    SESSION_STRING_N — Session string dell'account N
 
-  Esempio per 3 account:
-    API_ID_1, API_HASH_1, SESSION_STRING_1
-    API_ID_2, API_HASH_2, SESSION_STRING_2
-    API_ID_3, API_HASH_3, SESSION_STRING_3
-
-── PRIMO AVVIO (generazione SESSION_STRING) ───────────────────────────────────
-  1. Imposta API_ID_1 e API_HASH_1 (SESSION_STRING_1 lasciala vuota)
-  2. Esegui il bot — nei log apparirà la SESSION_STRING da copiare
-  3. Aggiungi SESSION_STRING_1 nelle variabili, poi aggiungi il secondo account, ecc.
-
-NOTA: Lo slave parte automaticamente e posta dal suo account.
-      Nessun comando locale — tutto è controllato dal master.
-      Il testo auto-risposta PM si imposta dal master con /replytext.
+── PRIMO AVVIO ───────────────────────────────────────────────────
+  1. Imposta API_ID_1 e API_HASH_1 (SESSION_STRING_1 vuota)
+  2. Avvia — nei log apparirà la SESSION_STRING da copiare
+  3. Aggiungi SESSION_STRING_1 e procedi con l'account successivo
 """
 
 import asyncio
@@ -45,40 +35,50 @@ from telethon.sessions import StringSession
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+REPLIED_USERS_MAX = 500
+
+
+# ── Utilità ───────────────────────────────────────────────────────────────────
+
+def normalize_master_url(url: str) -> str:
+    """Aggiunge automaticamente https:// se mancante."""
+    url = url.strip().rstrip("/")
+    if url and not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+        logging.warning(f"⚠️ MASTER_URL senza schema — aggiunto https:// automaticamente: {url}")
+    return url
 
 
 # ── Stato per account ─────────────────────────────────────────────────────────
 
-REPLIED_USERS_MAX = 500  # svuota dopo questa soglia per non crescere all'infinito
-
 class AccountState:
     def __init__(self):
         self.current_targets: list = []
-        self.replied_users: set = set()
+        self.replied_users: set    = set()
 
-    def maybe_clear_replied_users(self):
+    def maybe_clear_replied_users(self) -> None:
         if len(self.replied_users) >= REPLIED_USERS_MAX:
             self.replied_users.clear()
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def _fetch_master_config_sync(master_url: str) -> dict | None:
-    url = master_url.rstrip("/") + "/api/slave-config"
+def _fetch_config_sync(master_url: str) -> dict | None:
+    url = master_url + "/api/slave-config"
     try:
         with urllib.request.urlopen(url, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        logging.error(f"Errore HTTP master: {e.code} {e.reason}")
+        logging.error(f"❌ Errore HTTP dal master: {e.code} {e.reason}")
     except Exception as e:
-        logging.error(f"Impossibile contattare il master: {e}")
+        logging.error(f"❌ Impossibile contattare il master ({url}): {e}")
     return None
 
 async def fetch_master_config(master_url: str) -> dict | None:
-    """Fetch non-bloccante: eseguito in un thread separato per non bloccare asyncio."""
-    return await asyncio.to_thread(_fetch_master_config_sync, master_url)
+    return await asyncio.to_thread(_fetch_config_sync, master_url)
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -87,26 +87,24 @@ def build_buttons(buttons_rows: list) -> list | None:
     if not buttons_rows:
         return None
     return [
-        [Button.url(btn["text"], btn["url"]) for btn in row]
+        [Button.url(b["text"], b["url"]) for b in row]
         for row in buttons_rows
     ]
 
-
 def format_reply_text(template: str, user) -> str:
     first = user.first_name or ""
-    last  = user.last_name or ""
+    last  = user.last_name  or ""
     full  = f"{first} {last}".strip()
     uname = f"@{user.username}" if user.username else full
     return (
         template
         .replace("{first_name}", first)
-        .replace("{last_name}", last)
-        .replace("{full_name}", full)
-        .replace("{username}", uname)
+        .replace("{last_name}",  last)
+        .replace("{full_name}",  full)
+        .replace("{username}",   uname)
     )
 
-
-async def user_is_in_target(client, user_id: int, target) -> bool:
+async def user_is_in_target(client: TelegramClient, user_id: int, target) -> bool:
     try:
         entity = await client.get_entity(target)
         if not isinstance(entity, (Channel, Chat)):
@@ -119,7 +117,16 @@ async def user_is_in_target(client, user_id: int, target) -> bool:
         return False
 
 
-async def copy_to_target(client, log, msg, target, buttons_rows, _retries=0):
+# ── Invio messaggi ────────────────────────────────────────────────────────────
+
+async def copy_to_target(
+    client: TelegramClient,
+    log: logging.Logger,
+    msg,
+    target,
+    buttons_rows: list,
+    _retries: int = 0,
+) -> None:
     try:
         text     = msg.message or getattr(msg, "caption", "") or ""
         entities = msg.entities or []
@@ -132,41 +139,41 @@ async def copy_to_target(client, log, msg, target, buttons_rows, _retries=0):
                     formatting_entities=entities, buttons=buttons, silent=False
                 )
             except Exception as media_err:
-                log.warning(f"Media fallito su {target} ({media_err}) — invio solo testo")
+                log.warning(f"⚠️ Media fallito su {target} ({media_err}) — invio solo testo")
                 if text:
-                    await client.send_message(
-                        target, text,
-                        formatting_entities=entities, buttons=buttons
-                    )
+                    await client.send_message(target, text, formatting_entities=entities, buttons=buttons)
         else:
-            await client.send_message(
-                target, text,
-                formatting_entities=entities, buttons=buttons
-            )
+            await client.send_message(target, text, formatting_entities=entities, buttons=buttons)
+
         log.info(f"✅ msg {msg.id} → {target}")
 
     except FloodWaitError as e:
         if _retries >= 3:
-            log.error(f"FloodWait ripetuto ({_retries}x) su {target}, messaggio saltato.")
+            log.error(f"❌ FloodWait ripetuto ({_retries}x) su {target} — messaggio saltato.")
             return
-        log.warning(f"FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
+        log.warning(f"⏳ FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
         await asyncio.sleep(e.seconds + 1)
         await copy_to_target(client, log, msg, target, buttons_rows, _retries + 1)
     except Exception as e:
-        log.error(f"Errore → {target}: {e}")
+        log.error(f"❌ Errore → {target}: {e}")
 
 
 # ── Auto-risposta PM ──────────────────────────────────────────────────────────
 
-async def handle_private_message(event, client, log, master_url: str, state: AccountState):
+async def handle_private_message(
+    event,
+    client: TelegramClient,
+    log: logging.Logger,
+    master_url: str,
+    state: AccountState,
+) -> None:
     sender = await event.get_sender()
-    if sender is None or sender.bot or sender.is_self:
+    if sender is None or getattr(sender, "bot", False) or getattr(sender, "is_self", False):
         return
 
     user_id = sender.id
     if user_id in state.replied_users:
         return
-
     if not state.current_targets:
         return
 
@@ -178,74 +185,80 @@ async def handle_private_message(event, client, log, master_url: str, state: Acc
     if not reply_text:
         return
 
-    in_target = False
-    for target in state.current_targets:
-        if await user_is_in_target(client, user_id, target):
-            in_target = True
-            break
-
+    in_target = any(
+        await user_is_in_target(client, user_id, t)
+        for t in state.current_targets
+    )
     if not in_target:
         return
 
     state.replied_users.add(user_id)
-    log.info(f"💬 Auto-risposta PM a {sender.first_name} (id={user_id})")
+    log.info(f"💬 Auto-risposta a {sender.first_name} (id={user_id})")
 
     try:
-        text = format_reply_text(reply_text, sender)
-        await client.send_message(sender, text)
+        await client.send_message(sender, format_reply_text(reply_text, sender))
     except FloodWaitError as e:
-        log.warning(f"FloodWait auto-risposta {e.seconds}s")
+        log.warning(f"⏳ FloodWait auto-risposta {e.seconds}s")
         await asyncio.sleep(e.seconds + 1)
     except Exception as e:
-        log.error(f"Errore auto-risposta a {user_id}: {e}")
+        log.error(f"❌ Errore auto-risposta a {user_id}: {e}")
 
 
 # ── Spam loop ─────────────────────────────────────────────────────────────────
 
-async def spam_loop(client, log, master_url: str, account_index: int, state: AccountState):
+async def spam_loop(
+    client: TelegramClient,
+    log: logging.Logger,
+    master_url: str,
+    account_index: int,
+    state: AccountState,
+) -> None:
     while True:
         cfg = await fetch_master_config(master_url)
+
         if not cfg:
-            log.warning("Config master non disponibile, riprovo tra 60s")
+            log.warning("⚠️ Config master non disponibile — riprovo tra 60s")
             await asyncio.sleep(60)
             continue
 
         if not cfg.get("running", True):
-            log.info("Master ha fermato l'invio — in pausa")
+            log.info("⏸ Master ha fermato l'invio — in pausa")
             await asyncio.sleep(cfg.get("interval", 10) * 60)
             continue
 
-        # sorgenti: usa quelle specifiche dello slave, altrimenti quelle del master
         slave_sources_map = cfg.get("slave_sources", {})
-        my_sources = slave_sources_map.get(str(account_index)) or cfg.get("sources", [])
+        my_sources        = slave_sources_map.get(str(account_index)) or cfg.get("sources", [])
+        targets           = cfg.get("targets", [])
+        buttons_rows      = cfg.get("buttons_rows", [])
+        default_interval  = max(1, cfg.get("interval", 10))
+        interval          = max(1, cfg.get("slave_intervals", {}).get(str(account_index), default_interval))
 
-        targets      = cfg.get("targets", [])
-        buttons_rows = cfg.get("buttons_rows", [])
-        default_interval = max(1, cfg.get("interval", 10))
-        slave_intervals  = cfg.get("slave_intervals", {})
-        interval = max(1, slave_intervals.get(str(account_index), default_interval))
-
-        src_label = f"proprie ({len(my_sources)})" if str(account_index) in slave_sources_map else f"master ({len(my_sources)})"
-        log.info(f"⏱ Intervallo: {interval} min | Sorgenti: {src_label}")
+        src_label = (
+            f"proprie ({len(my_sources)})"
+            if str(account_index) in slave_sources_map
+            else f"master ({len(my_sources)})"
+        )
+        log.info(f"⏱ Intervallo: {interval} min | Sorgenti: {src_label} | Destinazioni: {len(targets)}")
 
         state.current_targets = targets
         state.maybe_clear_replied_users()
 
         if not my_sources or not targets:
-            log.info("Nessuna sorgente o destinazione configurata — attendo...")
+            log.info("📭 Nessuna sorgente o destinazione configurata — attendo...")
             await asyncio.sleep(interval * 60)
             continue
 
         for source in my_sources:
             try:
                 all_msgs = await client.get_messages(source, limit=200)
-                valid = [m for m in all_msgs if m.message or m.media]
+                valid    = [m for m in all_msgs if m.message or m.media]
+
                 if not valid:
+                    log.info(f"📭 Nessun messaggio valido in {source}")
                     continue
 
-                # messaggio casuale — ogni slave manda un post diverso
                 msg = random.choice(valid)
-                log.info(f"📤 Post random (id={msg.id}) da {source}")
+                log.info(f"📤 Post random (id={msg.id}) da {source} → {len(targets)} destinazioni")
 
                 await asyncio.gather(*[
                     copy_to_target(client, log, msg, t, buttons_rows)
@@ -253,15 +266,21 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
                 ])
 
             except Exception as e:
-                log.error(f"Errore sorgente {source}: {e}")
+                log.error(f"❌ Errore sorgente {source}: {e}")
 
+        log.info(f"✅ Ciclo completato — prossimo invio tra {interval} min")
         await asyncio.sleep(interval * 60)
 
 
 # ── Avvio account ─────────────────────────────────────────────────────────────
 
-async def run_account(account_index: int, api_id: int, api_hash: str,
-                      session_string: str, master_url: str):
+async def run_account(
+    account_index: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    master_url: str,
+) -> None:
     log   = logging.getLogger(f"account-{account_index}")
     state = AccountState()
 
@@ -269,19 +288,21 @@ async def run_account(account_index: int, api_id: int, api_hash: str,
     await client.start()
 
     if not session_string:
+        saved = client.session.save()
         print("\n" + "=" * 60)
-        print(f"✅ Account {account_index} — salva questa SESSION_STRING_{account_index}:")
-        print(client.session.save())
+        print(f"✅ Account {account_index} — salva questa variabile su Railway:")
+        print(f"SESSION_STRING_{account_index}={saved}")
         print("=" * 60 + "\n")
 
-    log.info(f"🚀 Connesso | master: {master_url} | avvio spam automatico")
+    me = await client.get_me()
+    log.info(f"🚀 Connesso come @{me.username or me.first_name} | master: {master_url}")
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def pm_handler(event):
         await handle_private_message(event, client, log, master_url, state)
 
     spam_task = asyncio.create_task(spam_loop(client, log, master_url, account_index, state))
-    log.info(f"🎉 Account {account_index} pronto — in esecuzione!")
+    log.info(f"🎉 Account {account_index} pronto — spam loop avviato!")
 
     try:
         await client.run_until_disconnected()
@@ -314,21 +335,22 @@ def load_accounts(master_url: str) -> list[dict]:
             "master_url":     master_url,
         })
         i += 1
-
     return accounts
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def main():
-    master_url = os.environ.get("MASTER_URL", "").rstrip("/")
+async def main() -> None:
+    raw_url    = os.environ.get("MASTER_URL", "")
+    master_url = normalize_master_url(raw_url)
 
     if not master_url:
         logging.error("❌ Imposta MASTER_URL come variabile d'ambiente!")
         return
 
-    accounts = load_accounts(master_url)
+    logging.info(f"🌐 Master URL: {master_url}")
 
+    accounts = load_accounts(master_url)
     if not accounts:
         logging.error(
             "❌ Nessun account trovato! Imposta almeno:\n"
