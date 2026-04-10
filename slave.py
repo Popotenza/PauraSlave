@@ -305,14 +305,13 @@ async def run_account(account_index: int, api_id: int, api_hash: str,
 
 def load_accounts(master_url: str) -> list[dict]:
     accounts = []
-    i = 1
-    while True:
+    for i in range(1, 21):
         api_id_str     = os.environ.get(f"API_ID_{i}")
         api_hash       = os.environ.get(f"API_HASH_{i}")
         session_string = os.environ.get(f"SESSION_STRING_{i}", "")
 
         if not api_id_str or not api_hash:
-            break
+            continue
 
         accounts.append({
             "index":          i,
@@ -321,7 +320,6 @@ def load_accounts(master_url: str) -> list[dict]:
             "session_string": session_string,
             "master_url":     master_url,
         })
-        i += 1
 
     return accounts
 
@@ -339,8 +337,8 @@ async def main():
 
     if not accounts:
         logging.error(
-            "❌ Nessun account trovato! Imposta almeno:\n"
-            "  API_ID_1, API_HASH_1, SESSION_STRING_1"
+            "❌ Nessun account trovato! Imposta almeno una coppia:\n"
+            "  API_ID_N, API_HASH_N, SESSION_STRING_N  (N tra 1 e 20)"
         )
         return
 
