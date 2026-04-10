@@ -26,6 +26,8 @@ tutti controllati dal master.
 NOTA: Lo slave parte automaticamente e posta dal suo account.
       Nessun comando locale — tutto è controllato dal master.
       Il testo auto-risposta PM si imposta dal master con /replytext.
+      Le addlist (link join) si impostano dal master con /ala e /alg.
+      Sorgenti/destinazioni vengono silenziate automaticamente all'avvio.
 """
 
 import asyncio
@@ -37,10 +39,24 @@ import urllib.request
 import urllib.error
 
 from telethon import TelegramClient, Button, events
-from telethon.errors import FloodWaitError, UserNotParticipantError, ChatAdminRequiredError
+from telethon.errors import (
+    FloodWaitError,
+    UserNotParticipantError,
+    ChatAdminRequiredError,
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+)
 from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import Channel, Chat
+from telethon.tl.functions.account import UpdateNotifySettingsRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.types import (
+    Channel, Chat,
+    InputPeerNotifySettings,
+    InputNotifyPeer,
+)
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +73,8 @@ class AccountState:
     def __init__(self):
         self.current_targets: list = []
         self.replied_users: set = set()
+        self.silenced_peers: set = set()   # peer già silenziati in questa sessione
+        self.joined_addlists: set = set()  # addlist già processate in questa sessione
 
     def maybe_clear_replied_users(self):
         if len(self.replied_users) >= REPLIED_USERS_MAX:
@@ -118,6 +136,97 @@ async def user_is_in_target(client, user_id: int, target) -> bool:
     except Exception:
         return False
 
+
+# ── Silenziamento chat ────────────────────────────────────────────────────────
+
+async def silence_peer(client, log, peer, label: str = ""):
+    """Silenzia una chat/canale (notifiche disattivate per sempre)."""
+    try:
+        entity = await client.get_entity(peer)
+        await client(UpdateNotifySettingsRequest(
+            peer=InputNotifyPeer(entity),
+            settings=InputPeerNotifySettings(
+                show_previews=False,
+                silent=True,
+                mute_until=2147483647,  # timestamp massimo = silenziato per sempre
+            )
+        ))
+        log.info(f"🔕 Silenziato: {label or peer}")
+    except Exception as e:
+        log.warning(f"Impossibile silenziare {label or peer}: {e}")
+
+
+async def silence_all_peers(client, log, sources: list, targets: list, state: AccountState):
+    """Silenzia tutte le sorgenti e destinazioni non ancora silenziate."""
+    all_peers = list(set(sources) | set(targets))
+    for peer in all_peers:
+        key = str(peer)
+        if key in state.silenced_peers:
+            continue
+        await silence_peer(client, log, peer, str(peer))
+        state.silenced_peers.add(key)
+
+
+# ── Addlist (join automatico) ─────────────────────────────────────────────────
+
+def _extract_invite_hash(link: str) -> str | None:
+    """Estrae l'hash dal link di invito Telegram."""
+    link = link.strip().rstrip("/")
+    for prefix in ("https://t.me/joinchat/", "http://t.me/joinchat/",
+                    "t.me/joinchat/", "https://t.me/+", "http://t.me/+", "t.me/+"):
+        if link.startswith(prefix):
+            return link[len(prefix):]
+    return None
+
+
+async def join_via_addlist(client, log, link: str, state: AccountState):
+    """Prova a entrare in un gruppo/canale tramite link di invito."""
+    if link in state.joined_addlists:
+        return  # già processato in questa sessione
+
+    state.joined_addlists.add(link)
+
+    invite_hash = _extract_invite_hash(link)
+    if not invite_hash:
+        log.warning(f"🔗 Addlist: link non riconosciuto come invito Telegram: {link}")
+        return
+
+    try:
+        await client(ImportChatInviteRequest(invite_hash))
+        log.info(f"✅ Addlist: entrato via {link}")
+    except UserAlreadyParticipantError:
+        log.info(f"ℹ️ Addlist: già membro — {link}")
+    except (InviteHashExpiredError, InviteHashInvalidError):
+        log.warning(f"❌ Addlist: link scaduto o non valido — {link}")
+    except FloodWaitError as e:
+        log.warning(f"FloodWait addlist {e.seconds}s — {link}")
+        await asyncio.sleep(e.seconds + 1)
+        # riprova una sola volta
+        try:
+            await client(ImportChatInviteRequest(invite_hash))
+            log.info(f"✅ Addlist (retry): entrato via {link}")
+        except Exception as e2:
+            log.error(f"❌ Addlist retry fallito per {link}: {e2}")
+    except Exception as e:
+        log.error(f"❌ Addlist: errore per {link}: {e}")
+
+
+async def process_addlists(client, log, cfg: dict, account_index: int, state: AccountState):
+    """Elabora le addlist globali e quelle specifiche di questo slave."""
+    global_addlists = cfg.get("global_addlists", [])
+    slave_addlists  = cfg.get("slave_addlists", {}).get(str(account_index), [])
+
+    all_links = list(dict.fromkeys(global_addlists + slave_addlists))  # deduplicati, ordine preservato
+
+    if not all_links:
+        return
+
+    for link in all_links:
+        await join_via_addlist(client, log, link, state)
+        await asyncio.sleep(2)  # piccola pausa tra un join e l'altro
+
+
+# ── Invio messaggi ────────────────────────────────────────────────────────────
 
 async def copy_to_target(client, log, msg, target, buttons_rows, _retries=0):
     try:
@@ -238,6 +347,12 @@ async def spam_loop(client, log, master_url: str, account_index: int, state: Acc
         state.current_targets = targets
         state.maybe_clear_replied_users()
 
+        # ── Processa addlist (entra nei gruppi/canali se non già fatto) ────────
+        await process_addlists(client, log, cfg, account_index, state)
+
+        # ── Silenzia sorgenti e destinazioni ──────────────────────────────────
+        await silence_all_peers(client, log, my_sources, targets, state)
+
         if not my_sources or not targets:
             log.info("Nessuna sorgente o destinazione configurata — attendo...")
             await asyncio.sleep(interval * 60)
@@ -283,6 +398,19 @@ async def run_account(account_index: int, api_id: int, api_hash: str,
         print("=" * 60 + "\n")
 
     log.info(f"🚀 Connesso | master: {master_url} | avvio spam automatico")
+
+    # ── Silenziamento iniziale: carica config e silenzia subito ───────────────
+    initial_cfg = await fetch_master_config(master_url)
+    if initial_cfg:
+        slave_key = str(account_index)
+        slave_specific = initial_cfg.get("slave_sources", {}).get(slave_key)
+        init_sources = slave_specific if slave_specific else initial_cfg.get("sources", [])
+        init_targets = initial_cfg.get("targets", [])
+        log.info("🔕 Silenziamento iniziale sorgenti e destinazioni...")
+        await silence_all_peers(client, log, init_sources, init_targets, state)
+        # Processa subito le addlist all'avvio
+        log.info("🔗 Elaborazione addlist iniziali...")
+        await process_addlists(client, log, initial_cfg, account_index, state)
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def pm_handler(event):
