@@ -6,7 +6,7 @@
 
 VARIABILI D'AMBIENTE RICHIESTE
 ───────────────────────────────
-  MASTER_URL       → URL del master  (es: https://tuomaster.up.railway.app)
+  MASTER_URL       → URL del master  (es: https:auomaster.up.railway.app)
 
   Per ogni account (ripeti con N = 1, 2, 3, ...):
     API_ID_N         → API ID account N  (da my.telegram.org)
@@ -190,11 +190,14 @@ async def silence_peers_list(client, log, sources: list, targets: list, state: A
 
 def _extract_slug(link: str) -> str | None:
     """
-    Estrae lo slug dal link t.me/addlist/SLUG.
+    Estrae lo slug dal link t.me/addlist/SLUG o telegram.me/addlist/SLUG.
     Restituisce None se il link non ha il formato atteso.
     """
     link = link.strip().rstrip("/")
-    for prefix in ("https://t.me/addlist/", "http://t.me/addlist/", "t.me/addlist/"):
+    for prefix in (
+        "https://t.me/addlist/", "http://t.me/addlist/", "t.me/addlist/",
+        "https://telegram.me/addlist/", "http://telegram.me/addlist/", "telegram.me/addlist/",
+    ):
         if link.lower().startswith(prefix):
             return link[len(prefix):]
     return None
@@ -215,7 +218,6 @@ async def process_addlist(client, log, link: str, state: AccountState) -> None:
     if slug in state.joined_addlists:
         return  # già elaborata in questa sessione, niente da fare
 
-    state.joined_addlists.add(slug)
     log.info(f"🔗 Addlist: elaborazione slug={slug}")
 
     # ── STEP 1: recupera la lista dei peer nella cartella ─────────
@@ -225,9 +227,17 @@ async def process_addlist(client, log, link: str, state: AccountState) -> None:
         log.error(f"❌ Addlist: impossibile verificare {link}: {e}")
         return
 
-    already_peers = getattr(info, "already_peers", []) or []   # peer in cui sei già membro
-    missing_peers = getattr(info, "missing_peers", []) or []   # peer da cui devi ancora entrare
-    all_peers     = already_peers + missing_peers
+    # L'API restituisce due tipi diversi:
+    # - chatlistInvite (primo accesso): ha solo il campo "peers" con tutti i peer da unire
+    # - chatlistInviteAlready (cartella già presente): ha "already_peers" e "missing_peers"
+    already_peers = getattr(info, "already_peers", []) or []
+    missing_peers = getattr(info, "missing_peers", []) or []
+
+    if not already_peers and not missing_peers:
+        # Prima volta: tutti i peer sono da unire (campo "peers")
+        missing_peers = getattr(info, "peers", []) or []
+
+    all_peers = already_peers + missing_peers
 
     if not all_peers:
         log.info(f"ℹ️ Addlist: cartella vuota o inaccessibile — {link}")
@@ -239,6 +249,7 @@ async def process_addlist(client, log, link: str, state: AccountState) -> None:
     )
 
     # ── STEP 2: entra in tutti i peer mancanti ───────────────────
+    join_ok = True
     if missing_peers:
         try:
             await client(JoinChatlistInviteRequest(slug=slug, peers=missing_peers))
@@ -251,8 +262,10 @@ async def process_addlist(client, log, link: str, state: AccountState) -> None:
                 log.info(f"✅ Addlist (retry): entrato in {len(missing_peers)} gruppi/canali")
             except Exception as e2:
                 log.error(f"❌ Addlist join fallito anche al retry: {e2}")
+                join_ok = False
         except Exception as e:
             log.error(f"❌ Addlist join fallito: {e}")
+            join_ok = False
 
     # ── STEP 3: silenzia ogni peer della cartella ────────────────
     log.info(f"🔕 Addlist: silenziamento di {len(all_peers)} peer...")
@@ -268,6 +281,11 @@ async def process_addlist(client, log, link: str, state: AccountState) -> None:
             await asyncio.sleep(0.3)  # piccola pausa per evitare rate-limit
         except Exception as e:
             log.warning(f"Impossibile silenziare peer della addlist: {e}")
+
+    if join_ok:
+        state.joined_addlists.add(slug)
+    else:
+        log.warning(f"⚠️ Addlist {slug} NON segnata come completata — verrà ritentata al prossimo ciclo")
 
 
 async def process_all_addlists(client, log, cfg: dict, account_index: int, state: AccountState) -> None:
