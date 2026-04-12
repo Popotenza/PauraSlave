@@ -5,9 +5,11 @@ Controlla tutti gli slave via HTTP.
 Invia comandi dai tuoi Messaggi Salvati.
 
 ── VARIABILI D'AMBIENTE ──────────────────────────────────────────
-  API_ID          — API ID dell'account master
-  API_HASH        — API Hash dell'account master
-  SESSION_STRING  — Session string (vuota al primo avvio)
+
+  API_ID_1        — API ID dell'account master  (fallback: API_ID)
+  API_HASH_1      — API Hash dell'account master (fallback: API_HASH)
+  SESSION_STRING_1 — Session string (vuota al primo avvio) (fallback: SESSION_STRING)
+
 """
 
 import asyncio
@@ -936,13 +938,14 @@ async def handle_command(client: TelegramClient, event, text: str) -> None:
 async def main() -> None:
     global config
 
-    api_id_str     = os.environ.get("API_ID")
-    api_hash       = os.environ.get("API_HASH")
-    session_string = os.environ.get("SESSION_STRING", "")
+    api_id_str     = os.environ.get("API_ID_1") or os.environ.get("API_ID")
+    api_hash       = os.environ.get("API_HASH_1") or os.environ.get("API_HASH")
+    session_string = os.environ.get("SESSION_STRING_1") or os.environ.get("SESSION_STRING", "")
 
     if not api_id_str or not api_hash:
         log.error("❌ Imposta API_ID e API_HASH come variabili d'ambiente!")
         return
+
 
     client = TelegramClient(StringSession(session_string), int(api_id_str), api_hash)
     await client.start()
