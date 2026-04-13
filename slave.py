@@ -1,18 +1,26 @@
 """
 Telegram Slave Userbot
 ========================
-Riceve la configurazione dal master via HTTP e fa spam autonomamente.
+Un solo processo, più account slave in parallelo.
+Ogni account è identificato da un numero nel nome delle variabili.
+
+Riceve la configurazione dal master via HTTP.
 Non risponde a nessun comando — tutto è controllato dal master.
 
-Auto-risposta PM: risponde solo a chi è membro di almeno uno
-dei gruppi di destinazione configurati dal master.
+Auto-risposta PM: solo per utenti che sono in almeno uno dei gruppi destinazione.
 
 ── VARIABILI D'AMBIENTE ──────────────────────────────────────────
-  API_ID          — API ID dell'account slave  (fallback: API_ID_1)
-  API_HASH        — API Hash dell'account slave (fallback: API_HASH_1)
-  SESSION_STRING  — Session string              (fallback: SESSION_STRING_1)
-  MASTER_URL      — URL base del master (es. https://master.railway.app)
-  SLAVE_NUMBER    — Numero dello slave (es. 1, 2, 3 …)
+  MASTER_URL        — URL base del master (es. https://master.railway.app)
+
+  Per ogni slave N (1, 2, 3 …):
+    API_ID_N          — API ID dell'account slave N
+    API_HASH_N        — API Hash dell'account slave N
+    SESSION_STRING_N  — Session string dell'account slave N
+
+  Esempio per 3 slave:
+    API_ID_1, API_HASH_1, SESSION_STRING_1
+    API_ID_2, API_HASH_2, SESSION_STRING_2
+    API_ID_3, API_HASH_3, SESSION_STRING_3
 """
 
 import asyncio
@@ -29,18 +37,24 @@ from telethon.sessions import StringSession
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s | slave=%(slave_n)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
 
-trigger_now = asyncio.Event()
-config: dict = {}
+MASTER_CONFIG: dict = {}
+MASTER_CONFIG_LOCK = asyncio.Lock()
 
-# Cache membership: {user_id: (is_member: bool, timestamp: float)}
-# Evita chiamate Telegram ripetute per lo stesso utente
 MEMBERSHIP_CACHE: dict[int, tuple[bool, float]] = {}
 MEMBERSHIP_CACHE_TTL = 600  # 10 minuti
+
+
+# ── Logging helper ────────────────────────────────────────────────────────────
+
+def get_log(slave_n: str):
+    """Logger con il numero slave già nel nome — visibile nei log di Railway."""
+    logger = logging.getLogger(f"slave.{slave_n}")
+    logger.addFilter(lambda r: r.__setattr__("slave_n", slave_n) or True)
+    return logging.LoggerAdapter(logging.getLogger(f"slave.{slave_n}"), {"slave_n": slave_n})
 
 
 # ── Fetch config dal master ────────────────────────────────────────────────────
@@ -52,22 +66,22 @@ def _empty_config() -> dict:
         "interval": 10,
         "running": True,
         "auto_reply_text": "",
+        "slave_intervals": {},
+        "slave_sources": {},
         "rotation_indices": {},
     }
 
-async def fetch_config_from_master() -> dict:
+async def fetch_master_config(log) -> dict:
     """
     Scarica slave_config.json dal master via HTTP.
-    Solo HTTP — zero chiamate Telegram, zero flood wait.
+    Chiamata HTTP pura — zero API Telegram, zero flood wait.
     """
-    global config
+    global MASTER_CONFIG
 
     master_url = os.environ.get("MASTER_URL", "").rstrip("/")
     if not master_url:
-        log.warning("⚠️  MASTER_URL non impostato — uso config precedente")
-        return config or _empty_config()
-
-    slave_n = str(os.environ.get("SLAVE_NUMBER", "1"))
+        log.warning("MASTER_URL non impostato — uso config precedente")
+        return MASTER_CONFIG or _empty_config()
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -76,51 +90,42 @@ async def fetch_config_from_master() -> dict:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    log.error(f"❌ Master ha risposto {resp.status} — uso config precedente")
-                    return config or _empty_config()
-                raw = await resp.json(content_type=None)
+                    log.error(f"Master ha risposto {resp.status} — uso config precedente")
+                    return MASTER_CONFIG or _empty_config()
+                data = await resp.json(content_type=None)
+
+        async with MASTER_CONFIG_LOCK:
+            old_rotation = MASTER_CONFIG.get("rotation_indices", {})
+            MASTER_CONFIG = data
+            MASTER_CONFIG.setdefault("rotation_indices", old_rotation)
+
+        return MASTER_CONFIG
     except Exception as e:
-        log.warning(f"⚠️ Impossibile contattare il master: {e} — uso config precedente")
-        return config or _empty_config()
+        log.warning(f"Impossibile contattare il master: {e} — uso config precedente")
+        return MASTER_CONFIG or _empty_config()
 
-    cfg = _empty_config()
-    cfg["running"]         = raw.get("running", True)
-    cfg["interval"]        = raw.get("interval", 10)
-    cfg["auto_reply_text"] = raw.get("auto_reply_text", "")
-    cfg["targets"]         = raw.get("targets", [])
 
-    # Sorgenti dedicate a questo slave, altrimenti quelle del master
+def _slave_config(raw: dict, slave_n: str) -> dict:
+    """
+    Estrae dalla config master i valori specifici per questo slave:
+    - slave_sources[n]  se esiste, altrimenti le sorgenti master
+    - slave_intervals[n] se esiste, altrimenti l'intervallo master
+    """
+    cfg = dict(raw)
+
     slave_sources = raw.get("slave_sources", {}).get(slave_n)
-    if slave_sources:
-        cfg["sources"] = slave_sources
-        log.info(f"📥 Sorgenti slave {slave_n}: {slave_sources}")
-    else:
-        cfg["sources"] = raw.get("sources", [])
+    cfg["sources"] = slave_sources if slave_sources else raw.get("sources", [])
 
-    # Intervallo dedicato a questo slave, altrimenti quello del master
     slave_interval = raw.get("slave_intervals", {}).get(slave_n)
-    if slave_interval:
-        cfg["interval"] = int(slave_interval)
-        log.info(f"⏰ Intervallo slave {slave_n}: {cfg['interval']} min")
+    cfg["interval"] = int(slave_interval) if slave_interval else raw.get("interval", 10)
 
-    # Preserva gli indici di rotazione già in memoria
-    cfg["rotation_indices"] = (config or {}).get("rotation_indices", {})
-
-    log.info(
-        f"🔄 Config aggiornata | "
-        f"{len(cfg['sources'])} sorgenti | "
-        f"{len(cfg['targets'])} destinazioni | "
-        f"intervallo {cfg['interval']} min | "
-        f"running={cfg['running']}"
-    )
     return cfg
 
 
 # ── Invio messaggi ────────────────────────────────────────────────────────────
 
-async def copy_to_target(
-    client: TelegramClient, msg, target, cfg: dict, _retries: int = 0
-) -> None:
+async def copy_to_target(client, msg, target, _retries: int = 0, log=None) -> None:
+    log = log or logging.getLogger("slave")
     try:
         text     = msg.message or getattr(msg, "caption", "") or ""
         entities = msg.entities or []
@@ -132,52 +137,52 @@ async def copy_to_target(
                     formatting_entities=entities, silent=False,
                 )
             except Exception as media_err:
-                log.warning(f"⚠️ Media fallito su {target} ({media_err}) — invio solo testo")
+                log.warning(f"Media fallito su {target} ({media_err}) — invio solo testo")
                 if text:
                     await client.send_message(target, text, formatting_entities=entities)
         else:
             await client.send_message(target, text, formatting_entities=entities)
 
-        log.info(f"✅ msg {msg.id} → {target}")
+        log.info(f"msg {msg.id} → {target}")
 
     except FloodWaitError as e:
         if _retries >= 3:
-            log.error(f"❌ FloodWait ripetuto ({_retries}x) su {target}, messaggio saltato.")
+            log.error(f"FloodWait ripetuto ({_retries}x) su {target} — saltato")
             return
-        wait = e.seconds + 1
-        log.warning(f"⏳ FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
-        await asyncio.sleep(wait)
-        await copy_to_target(client, msg, target, cfg, _retries + 1)
+        log.warning(f"FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
+        await asyncio.sleep(e.seconds + 1)
+        await copy_to_target(client, msg, target, _retries + 1, log)
     except Exception as e:
-        log.error(f"❌ Errore → {target}: {e}")
+        log.error(f"Errore → {target}: {e}")
 
 
-# ── Spam loop ─────────────────────────────────────────────────────────────────
+# ── Spam loop per singolo slave ───────────────────────────────────────────────
 
-async def spam_loop(client: TelegramClient) -> None:
+async def spam_loop(client: TelegramClient, slave_n: str) -> None:
     """
-    Ad ogni ciclo:
-      1. Aggiorna config dal master via HTTP (nessuna chiamata Telegram)
-      2. Se running=False, aspetta 30s e riprova
-      3. Invia il prossimo messaggio ruotato a tutte le destinazioni
+    Loop indipendente per ogni account slave.
+    Aggiorna la config dal master ad ogni ciclo (solo HTTP).
+    Usa la config specifica per questo slave (sorgenti e intervallo dedicati).
     """
-    global config
+    log = get_log(slave_n)
+    rotation: dict = {}
 
     while True:
-        config = await fetch_config_from_master()
+        raw = await fetch_master_config(log)
+        cfg = _slave_config(raw, slave_n)
 
-        if not config.get("running", True):
-            log.info("⏸ Slave in pausa (running=False dal master)")
+        if not cfg.get("running", True):
+            log.info("Slave in pausa (running=False)")
             await asyncio.sleep(30)
             continue
 
-        sources = config.get("sources", [])
-        targets = config.get("targets", [])
+        sources = cfg.get("sources", [])
+        targets = cfg.get("targets", [])
 
         if not sources:
-            log.info("📭 Nessuna sorgente — aspetto prossimo ciclo")
+            log.info("Nessuna sorgente — aspetto")
         elif not targets:
-            log.info("📭 Nessuna destinazione — aspetto prossimo ciclo")
+            log.info("Nessuna destinazione — aspetto")
         else:
             for source in sources[:]:
                 try:
@@ -187,39 +192,31 @@ async def spam_loop(client: TelegramClient) -> None:
                         key=lambda m: m.id,
                     )
                     if not valid:
-                        log.info(f"📭 Nessun post valido in {source}")
+                        log.info(f"Nessun post valido in {source}")
                         continue
 
                     key = str(source)
-                    idx = config["rotation_indices"].get(key, 0) % len(valid)
+                    idx = rotation.get(key, 0) % len(valid)
                     msg = valid[idx]
-                    log.info(f"📤 Post {idx + 1}/{len(valid)} (id={msg.id}) da {source}")
+                    log.info(f"Post {idx + 1}/{len(valid)} (id={msg.id}) da {source}")
 
                     for t in targets:
-                        await copy_to_target(client, msg, t, config)
+                        await copy_to_target(client, msg, t, log=log)
                         await asyncio.sleep(1.5)
-                    config["rotation_indices"][key] = (idx + 1) % len(valid)
+
+                    rotation[key] = (idx + 1) % len(valid)
 
                 except Exception as e:
-                    log.error(f"❌ Errore sorgente {source}: {e}")
+                    log.error(f"Errore sorgente {source}: {e}")
 
-        interval = max(1, config.get("interval", 10))
-        log.info(f"⏰ Prossimo ciclo tra {interval} min")
-        try:
-            await asyncio.wait_for(trigger_now.wait(), timeout=interval * 60)
-            trigger_now.clear()
-        except asyncio.TimeoutError:
-            pass
+        interval = max(1, cfg.get("interval", 10))
+        log.info(f"Prossimo ciclo tra {interval} min")
+        await asyncio.sleep(interval * 60)
 
 
 # ── Membership check ──────────────────────────────────────────────────────────
 
 def _bare_id(peer_id) -> int:
-    """
-    Normalizza qualsiasi formato di peer_id al bare ID numerico.
-    Telethon salva i canali/supergruppi come -100XXXXXXXXXX,
-    ma get_common_chats() restituisce il bare ID positivo.
-    """
     pid = int(peer_id)
     if pid < 0:
         s = str(pid)
@@ -230,65 +227,41 @@ def _bare_id(peer_id) -> int:
 
 
 async def is_member_of_any_target(client: TelegramClient, user_id: int) -> bool:
-    """
-    Controlla se l'utente è membro di almeno uno dei gruppi di destinazione
-    usando get_common_chats(): una singola chiamata API che restituisce
-    tutti i gruppi in comune tra lo slave e l'utente.
-
-    Nessun bisogno di permessi admin. Nessun loop per gruppo.
-    Cache 10 minuti per utente per non ripetere la chiamata.
-    """
-    targets = config.get("targets", [])
+    targets = MASTER_CONFIG.get("targets", [])
     if not targets:
         return False
 
-    # Controlla cache
     now = time.monotonic()
     cached = MEMBERSHIP_CACHE.get(user_id)
     if cached is not None:
         result, ts = cached
         if now - ts < MEMBERSHIP_CACHE_TTL:
-            log.debug(f"👤 {user_id} — risultato da cache: {result}")
             return result
         del MEMBERSHIP_CACHE[user_id]
 
-    # Singola chiamata API: gruppi in comune tra questo account e l'utente
     try:
         common_chats = await client.get_common_chats(user_id)
-    except Exception as e:
-        log.warning(f"⚠️ get_common_chats fallito per {user_id}: {e}")
+    except Exception:
         MEMBERSHIP_CACHE[user_id] = (False, now)
         return False
 
-    # Confronta gli ID normalizzati
-    common_ids  = {_bare_id(c.id) for c in common_chats}
-    target_ids  = {_bare_id(t)   for t in targets}
-    is_member   = bool(common_ids & target_ids)
+    common_ids = {_bare_id(c.id) for c in common_chats}
+    target_ids = {_bare_id(t)   for t in targets}
+    is_member  = bool(common_ids & target_ids)
 
     MEMBERSHIP_CACHE[user_id] = (is_member, now)
-    log.debug(
-        f"👤 {user_id} — gruppi comuni: {len(common_ids)}, "
-        f"match destinazioni: {is_member} (salvato in cache)"
-    )
     return is_member
 
 
 # ── Auto-risposta PM ──────────────────────────────────────────────────────────
 
-async def handle_auto_reply(client: TelegramClient, event) -> None:
-    """
-    Risponde solo se il mittente è membro di almeno uno dei gruppi destinazione.
-    """
-    reply_text = config.get("auto_reply_text", "")
+async def handle_auto_reply(client: TelegramClient, event, log) -> None:
+    reply_text = MASTER_CONFIG.get("auto_reply_text", "")
     if not reply_text:
         return
 
     sender = await event.get_sender()
-    user_id = sender.id
-
-    # Controlla membership prima di rispondere
-    if not await is_member_of_any_target(client, user_id):
-        log.debug(f"👤 {user_id} non è in nessun gruppo destinazione — auto-risposta saltata")
+    if not await is_member_of_any_target(client, sender.id):
         return
 
     try:
@@ -302,20 +275,58 @@ async def handle_auto_reply(client: TelegramClient, event) -> None:
             username=getattr(sender, "username", "") or "",
         )
         await event.reply(text)
-        log.info(f"💬 Auto-risposta inviata a {user_id} (membro confermato)")
+        log.info(f"Auto-risposta inviata a {sender.id}")
     except Exception as e:
-        log.error(f"❌ Errore auto-risposta: {e}")
+        log.error(f"Errore auto-risposta: {e}")
+
+
+# ── Avvio singolo slave ───────────────────────────────────────────────────────
+
+async def start_slave(slave_n: str) -> asyncio.Task | None:
+    """
+    Avvia un account slave.
+    Legge le credenziali da API_ID_N, API_HASH_N, SESSION_STRING_N.
+    Ritorna il task dello spam loop, o None se le credenziali mancano.
+    """
+    log = get_log(slave_n)
+
+    api_id_str     = os.environ.get(f"API_ID_{slave_n}")
+    api_hash       = os.environ.get(f"API_HASH_{slave_n}")
+    session_string = os.environ.get(f"SESSION_STRING_{slave_n}", "")
+
+    if not api_id_str or not api_hash:
+        log.info(f"API_ID_{slave_n} non trovato — slave non avviato")
+        return None
+
+    log.info(f"Slave {slave_n} in avvio...")
+
+    client = TelegramClient(StringSession(session_string), int(api_id_str), api_hash)
+    await client.start()
+
+    if not session_string:
+        print(f"\n{'='*60}")
+        print(f"[Slave {slave_n}] Salva questa SESSION_STRING_{slave_n}:")
+        print(client.session.save())
+        print(f"{'='*60}\n")
+
+    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    async def auto_reply_handler(event):
+        if MASTER_CONFIG.get("auto_reply_text"):
+            await handle_auto_reply(client, event, log)
+
+    log.info(f"Slave {slave_n} pronto")
+    return asyncio.create_task(spam_loop(client, slave_n))
 
 
 # ── HTTP healthcheck ──────────────────────────────────────────────────────────
 
-async def start_http_server() -> None:
+async def start_http_server(slave_count: int) -> None:
     async def handle_health(request):
         return web.Response(
             text=json.dumps({
-                "status":  "ok",
-                "slave":   os.environ.get("SLAVE_NUMBER", "1"),
-                "running": config.get("running", True),
+                "status":      "ok",
+                "slave_count": slave_count,
+                "running":     MASTER_CONFIG.get("running", True),
             }),
             content_type="application/json",
         )
@@ -327,7 +338,7 @@ async def start_http_server() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info(f"🌐 HTTP healthcheck sulla porta {port}")
+    logging.info(f"HTTP healthcheck sulla porta {port} — {slave_count} slave attivi")
     while True:
         await asyncio.sleep(3600)
 
@@ -335,50 +346,40 @@ async def start_http_server() -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global config
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    log = logging.getLogger("main")
 
-    api_id_str     = os.environ.get("API_ID") or os.environ.get("API_ID_1")
-    api_hash       = os.environ.get("API_HASH") or os.environ.get("API_HASH_1")
-    session_string = os.environ.get("SESSION_STRING") or os.environ.get("SESSION_STRING_1", "")
+    # Fetch iniziale config dal master
+    master_log = get_log("?")
+    await fetch_master_config(master_log)
 
-    if not api_id_str or not api_hash:
-        log.error("❌ Imposta API_ID e API_HASH come variabili d'ambiente!")
+    # Avvia tutti gli slave trovati (cerca API_ID_1, API_ID_2, API_ID_3 …)
+    tasks = []
+    slave_n = 1
+    while True:
+        task = await start_slave(str(slave_n))
+        if task is None and slave_n > 1:
+            break  # nessuna credenziale trovata per questo numero → stop
+        if task:
+            tasks.append(task)
+        slave_n += 1
+
+    if not tasks:
+        log.error("Nessun slave avviato. Imposta almeno API_ID_1, API_HASH_1, SESSION_STRING_1")
         return
 
-    slave_n = os.environ.get("SLAVE_NUMBER", "1")
-    log.info(f"🤖 Slave {slave_n} in avvio...")
+    log.info(f"Totale slave avviati: {len(tasks)}")
 
-    client = TelegramClient(StringSession(session_string), int(api_id_str), api_hash)
-    await client.start()
+    http_task = asyncio.create_task(start_http_server(len(tasks)))
 
-    if not session_string:
-        print("\n" + "=" * 60)
-        print("✅ Salva questa SESSION_STRING nelle variabili d'ambiente:")
-        print(client.session.save())
-        print("=" * 60 + "\n")
-
-    config = await fetch_config_from_master()
-
-    log.info(
-        f"🚀 Slave {slave_n} avviato | "
-        f"{len(config['sources'])} sorgenti | "
-        f"{len(config['targets'])} destinazioni | "
-        f"intervallo {config['interval']} min"
-    )
-
-    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def auto_reply_handler(event):
-        if config.get("auto_reply_text"):
-            await handle_auto_reply(client, event)
-
-    spam_task = asyncio.create_task(spam_loop(client))
-    http_task = asyncio.create_task(start_http_server())
-
-    log.info(f"🎉 Slave {slave_n} pronto — nessun comando, tutto dal master")
-    await client.run_until_disconnected()
-
-    spam_task.cancel()
-    http_task.cancel()
+    try:
+        await asyncio.gather(*tasks, http_task)
+    except Exception as e:
+        log.error(f"Errore: {e}")
 
 
 if __name__ == "__main__":
