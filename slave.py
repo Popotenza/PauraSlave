@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import urllib.parse
+import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError
@@ -41,33 +42,109 @@ _folder_tasks: dict[str, asyncio.Task] = {}   # task per ogni regola cartella
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+MASTER_URL         = os.environ.get("MASTER_URL", "").rstrip("/")
+CONFIG_SYNC_INTERVAL = int(os.environ.get("CONFIG_SYNC_INTERVAL", "30"))  # secondi
+
+_DEFAULT_CFG: dict = {
+    "sources": [],
+    "targets": [],
+    "interval": 10,
+    "slave_intervals": {},
+    "slave_sources": {},
+    "last_ids": {},
+    "running": True,
+    "buttons_rows": [],
+    "rotation_indices": {},
+    "auto_reply_text": "",
+    "folder_rules": {},
+}
+
+
+def _apply_defaults(cfg: dict) -> dict:
+    for k, v in _DEFAULT_CFG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+async def fetch_master_config() -> dict | None:
+    """Fetcha la configurazione dal master via HTTP GET {MASTER_URL}/api/slave-config.
+    Ritorna il dict parsato, oppure None in caso di errore."""
+    url = f"{MASTER_URL}/api/slave-config"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    log.warning(f"⚠️ Master ha risposto {resp.status} su {url}")
+                    return None
+                data = await resp.json(content_type=None)
+                log.info(f"✅ Config fetchata dal master ({url})")
+                return data
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Timeout nel fetch config dal master ({url})")
+    except aiohttp.ClientConnectionError as e:
+        log.warning(f"⚠️ Connessione al master fallita ({url}): {e}")
+    except Exception as e:
+        log.warning(f"⚠️ Errore fetch config master ({url}): {e}")
+    return None
+
+
 def load_config() -> dict:
+    """Carica la config locale (usata come fallback sincrono all'avvio)."""
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        cfg.setdefault("buttons_rows", [])
-        cfg.setdefault("interval", 10)
-        cfg.setdefault("slave_intervals", {})
-        cfg.setdefault("slave_sources", {})
-        cfg.setdefault("last_ids", {})
-        cfg.setdefault("running", True)
-        cfg.setdefault("rotation_indices", {})
-        cfg.setdefault("auto_reply_text", "")
-        cfg.setdefault("folder_rules", {})
-        return cfg
-    return {
-        "sources": [],
-        "targets": [],
-        "interval": 10,
-        "slave_intervals": {},
-        "slave_sources": {},
-        "last_ids": {},
-        "running": True,
-        "buttons_rows": [],
-        "rotation_indices": {},
-        "auto_reply_text": "",
-        "folder_rules": {},
-    }
+        return _apply_defaults(cfg)
+    return dict(_DEFAULT_CFG)
+
+
+async def load_config_async() -> dict:
+    """Carica la config: prima tenta il master (se MASTER_URL è impostato),
+    poi fa fallback al config.json locale."""
+    if MASTER_URL:
+        cfg = await fetch_master_config()
+        if cfg is not None:
+            log.info(
+                f"🛰️  Slave avviato con config dal master | "
+                f"{len(cfg.get('sources', []))} sorgenti | "
+                f"{len(cfg.get('targets', []))} destinazioni"
+            )
+            return _apply_defaults(cfg)
+        log.warning("⚠️ Fetch master fallito — uso config.json locale come fallback")
+    else:
+        log.info("ℹ️  MASTER_URL non impostato — uso config.json locale")
+    return load_config()
+
+
+async def config_sync_loop() -> None:
+    """Loop periodico: ogni CONFIG_SYNC_INTERVAL secondi refetcha la config
+    dal master e aggiorna la config globale se è cambiata."""
+    if not MASTER_URL:
+        log.info("🔕 config_sync_loop disabilitato (MASTER_URL non impostato)")
+        return
+
+    log.info(f"🔄 config_sync_loop avviato — refresh ogni {CONFIG_SYNC_INTERVAL}s")
+    while True:
+        await asyncio.sleep(CONFIG_SYNC_INTERVAL)
+        new_cfg = await fetch_master_config()
+        if new_cfg is None:
+            continue
+
+        _apply_defaults(new_cfg)
+
+        # Confronta le chiavi rilevanti per rilevare cambiamenti
+        changed_keys = [
+            k for k in ("sources", "targets", "interval", "running",
+                         "buttons_rows", "slave_intervals", "slave_sources",
+                         "auto_reply_text", "folder_rules")
+            if new_cfg.get(k) != config.get(k)
+        ]
+
+        if changed_keys:
+            log.info(f"🔄 Config aggiornata dal master — cambiamenti: {', '.join(changed_keys)}")
+            config.update(new_cfg)
+        else:
+            log.debug("🔄 Config dal master invariata — nessun aggiornamento")
 
 def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -956,13 +1033,21 @@ async def main() -> None:
         print(client.session.save())
         print("=" * 60 + "\n")
 
-    config = load_config()
-    log.info(
-        f"🚀 Master avviato | "
-        f"{len(config['sources'])} sorgenti | "
-        f"{len(config['targets'])} destinazioni | "
-        f"{len(config.get('folder_rules', {}))} regole cartella"
-    )
+    config = await load_config_async()
+    if not MASTER_URL:
+        log.info(
+            f"🚀 Master avviato | "
+            f"{len(config['sources'])} sorgenti | "
+            f"{len(config['targets'])} destinazioni | "
+            f"{len(config.get('folder_rules', {}))} regole cartella"
+        )
+    else:
+        log.info(
+            f"🚀 Slave avviato | "
+            f"{len(config['sources'])} sorgenti | "
+            f"{len(config['targets'])} destinazioni | "
+            f"{len(config.get('folder_rules', {}))} regole cartella"
+        )
 
     if config["running"]:
         trigger_now.set()
@@ -980,14 +1065,19 @@ async def main() -> None:
         if text:
             await handle_command(client, event, text)
 
-    spam_task = asyncio.create_task(spam_loop(client, config))
-    http_task = asyncio.create_task(start_http_server())
+    spam_task        = asyncio.create_task(spam_loop(client, config))
+    http_task        = asyncio.create_task(start_http_server())
+    sync_task        = asyncio.create_task(config_sync_loop())
 
-    log.info("🎉 Master pronto! Invia comandi in 'Messaggi Salvati'")
+    if MASTER_URL:
+        log.info("🎉 Slave pronto! Sincronizzazione config dal master attiva.")
+    else:
+        log.info("🎉 Master pronto! Invia comandi in 'Messaggi Salvati'")
     await client.run_until_disconnected()
 
     spam_task.cancel()
     http_task.cancel()
+    sync_task.cancel()
     for task in _folder_tasks.values():
         task.cancel()
 
