@@ -37,6 +37,7 @@ SLAVE_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slave_config.json")
 trigger_now    = asyncio.Event()
 config: dict   = {}
 _folder_tasks: dict[str, asyncio.Task] = {}   # task per ogni regola cartella
+telegram_connected: bool = False               # True solo quando il client è connesso
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -423,7 +424,17 @@ async def start_http_server() -> None:
         return web.Response(text=content, content_type="application/json")
 
     async def handle_health(request):
-        return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json")
+        if telegram_connected:
+            return web.Response(
+                text=json.dumps({"status": "ok", "telegram": "connected"}),
+                content_type="application/json",
+            )
+        return web.Response(
+            status=503,
+            text=json.dumps({"status": "degraded", "telegram": "disconnected"}),
+            content_type="application/json",
+        )
+
 
     port = int(os.environ.get("PORT", 8080))
     app  = web.Application()
@@ -933,10 +944,45 @@ async def handle_command(client: TelegramClient, event, text: str) -> None:
         await event.reply(HELP_TEXT)
 
 
+# ── Connessione con retry ─────────────────────────────────────────────────────
+
+async def connect_with_retry(client: TelegramClient) -> bool:
+    """
+    Tenta di connettere il client Telethon con backoff esponenziale.
+    Ritorna True se la connessione ha avuto successo, False se interrotta.
+    Ritenta indefinitamente: 5s → 10s → 20s → 40s → 60s (max).
+    """
+    global telegram_connected
+    delay = 5
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            log.info(f"🔌 Tentativo di connessione a Telegram (#{attempt})...")
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError(
+                    "SESSION_STRING non autorizzata o scaduta. "
+                    "Genera una nuova SESSION_STRING."
+                )
+            telegram_connected = True
+            log.info("✅ Connesso a Telegram con successo.")
+            return True
+        except Exception as e:
+            telegram_connected = False
+            log.error(
+                f"❌ Connessione fallita (tentativo #{attempt}): {e} — "
+                f"nuovo tentativo tra {delay}s"
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global config
+    global config, telegram_connected
 
     api_id_str     = os.environ.get("API_ID_1") or os.environ.get("API_ID")
     api_hash       = os.environ.get("API_HASH_1") or os.environ.get("API_HASH")
@@ -946,9 +992,23 @@ async def main() -> None:
         log.error("❌ Imposta API_ID e API_HASH come variabili d'ambiente!")
         return
 
+    config = load_config()
+    globals()["pending_link"] = None
 
     client = TelegramClient(StringSession(session_string), int(api_id_str), api_hash)
-    await client.start()
+
+    # L'HTTP server parte subito, indipendentemente dallo stato di Telegram
+    http_task = asyncio.create_task(start_http_server())
+
+    # Tenta la connessione con retry; se fallisce continua a riprovare
+    connected = await connect_with_retry(client)
+
+    if not connected:
+        # connect_with_retry è indefinito, quindi questo ramo non viene mai
+        # raggiunto in pratica — ma per sicurezza gestiamo il caso
+        log.warning("⚠️ Servizio online ma non connesso a Telegram — in attesa di SESSION_STRING valida")
+        await http_task
+        return
 
     if not session_string:
         print("\n" + "=" * 60)
@@ -956,7 +1016,6 @@ async def main() -> None:
         print(client.session.save())
         print("=" * 60 + "\n")
 
-    config = load_config()
     log.info(
         f"🚀 Master avviato | "
         f"{len(config['sources'])} sorgenti | "
@@ -972,8 +1031,6 @@ async def main() -> None:
         _start_folder_task(client, folder_name)
         log.info(f"📁 Task cartella '{folder_name}' avviato da config salvata")
 
-    globals()["pending_link"] = None
-
     @client.on(events.NewMessage(chats="me", outgoing=True))
     async def command_handler(event):
         text = (event.message.text or "").strip()
@@ -981,15 +1038,22 @@ async def main() -> None:
             await handle_command(client, event, text)
 
     spam_task = asyncio.create_task(spam_loop(client, config))
-    http_task = asyncio.create_task(start_http_server())
 
     log.info("🎉 Master pronto! Invia comandi in 'Messaggi Salvati'")
-    await client.run_until_disconnected()
+
+    try:
+        await client.run_until_disconnected()
+    finally:
+        telegram_connected = False
+        log.warning("⚠️ Servizio online ma non connesso a Telegram — in attesa di SESSION_STRING valida")
 
     spam_task.cancel()
-    http_task.cancel()
     for task in _folder_tasks.values():
         task.cancel()
+
+    # Dopo la disconnessione, ritenta la connessione mantenendo l'HTTP server vivo
+    log.info("🔄 Avvio retry loop dopo disconnessione...")
+    await connect_with_retry(client)
 
 
 if __name__ == "__main__":
